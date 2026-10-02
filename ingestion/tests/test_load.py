@@ -96,6 +96,26 @@ def test_manifest_mismatch_rolls_back(tmp_path):
     assert query(db, "SELECT count(*) FROM raw._load_log")[0][0] == 0
 
 
+def test_failed_load_does_not_leave_new_columns(tmp_path):
+    raw = tmp_path / "raw"
+    write_partition(raw, "2025-09-01", ROWS)
+    run(tmp_path)
+    write_partition(
+        raw, "2025-09-02", ["2025-09-02,Mortgage,,N/A,4,Web\n"],
+        header=HEADER.strip() + ",Submitted via\n",
+    )
+    manifest = raw / "date_received=2025-09-02" / "manifest.json"
+    data = json.loads(manifest.read_text())
+    data["row_count"] = 5
+    manifest.write_text(json.dumps(data))
+
+    code, db = run(tmp_path)
+    assert code == 1
+    columns = [r[0] for r in query(db, "SELECT column_name FROM information_schema.columns "
+                                       "WHERE table_name = 'complaints'")]
+    assert "submitted_via" not in columns
+
+
 def test_incomplete_partition_is_skipped(tmp_path):
     part = tmp_path / "raw" / "date_received=2025-09-01"
     part.mkdir(parents=True)

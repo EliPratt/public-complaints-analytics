@@ -75,7 +75,7 @@ def sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 def quote_ident(name: str) -> str:
-    return "'" + name.replace('"', '""') + '"'
+    return '"' + name.replace('"', '""') + '"'
 
 def discover_partitions(
         raw_dir: Path, start: date | None = None, end: date | None = None
@@ -114,11 +114,11 @@ def ensure_tables(con: duckdb.DuckDBPyConnection) -> None:
                     _partition_date DATE NOT NULL,
                     _source_file VARCHAR NOT NULL,
                     _extracted_at TIMESTAMPTZ NOT NULL,
-                    _loaded_at TIMESTAMPZ NOT NULL
+                    _loaded_at TIMESTAMPTZ NOT NULL
                 )                
             """)
     con.execute(f"""
-                CREATE TABLE IF NOT EXISTS {LOAD_LOGS} (
+                CREATE TABLE IF NOT EXISTS {LOAD_LOG} (
                     partition_date DATE PRIMARY KEY,
                     extracted_at VARCHAR NOT NULL,
                     row_count INTEGER NOT NULL,
@@ -126,14 +126,14 @@ def ensure_tables(con: duckdb.DuckDBPyConnection) -> None:
                 )
             """)
     
-def table_columns(con: duckdb.DuckDBByConnection) -> set[str]:
+def table_columns(con: duckdb.DuckDBPyConnection) -> set[str]:
     rows = con.execute(
         "SELECT column_name FROM information_schema.columns "
         "WHERE table_schema = 'raw' AND table_name = 'complaints'"
     ).fetchall()
     return {r[0] for r in rows}
 
-def file_columns(con: duckdb.DuckDBByConnection, csv_path: Path) -> list[str]:
+def file_columns(con: duckdb.DuckDBPyConnection, csv_path: Path) -> list[str]:
     """Original header names from a CSV file.
     hive_partitioning is off because DuckDB would otherwise read the
     date_received=YYYY-MM-DD folder name as an extra column."""
@@ -143,7 +143,7 @@ def file_columns(con: duckdb.DuckDBByConnection, csv_path: Path) -> list[str]:
     ).fetchall()
     return [r[0] for r in rel]
 
-def sync_schema(con: duckdb.DuckDBByConnection, normalized: list[str]) -> list[str]:
+def sync_schema(con: duckdb.DuckDBPyConnection, normalized: list[str]) -> list[str]:
     """Add any new source columns to the table. Returns the ones added."""
     existing = table_columns(con)
     added = [c for c in normalized if c not in existing]
@@ -151,25 +151,27 @@ def sync_schema(con: duckdb.DuckDBByConnection, normalized: list[str]) -> list[s
         con.execute(f"ALTER TABLE {TABLE} ADD COLUMN {quote_ident(col)} VARCHAR")
     return added
 
-def already_loaded(con: duckdb.DuckDBByConnection, p: Partition) -> bool:
+def already_loaded(con: duckdb.DuckDBPyConnection, p: Partition) -> bool:
     row = con.execute(
         f"SELECT extracted_at FROM {LOAD_LOG} WHERE partition_date = ?", [p.day]
     ).fetchone()
     return row is not None and row[0] == p.extracted_at
 
-def load_partition(con: duckdb.DuckDBByConnection, p: Partition, first_load: bool) -> int:
+def load_partition(con: duckdb.DuckDBPyConnection, p: Partition, first_load: bool) -> int:
     """Replace one day's rows in a single transaction. Returns rows loaded."""
     if p.row_count > 0:
         original = file_columns(con, p.csv_path)
         normalized = [normalize_column(c) for c in original]
         if len(set(normalized)) != len(normalized):
             raise ValueError(f"{p.day}: duplicate column names after normalizing: {original}")
-        added = sync_schema(con, normalized)
-        if added and not first_load:
-            log.warning("%s: new source columns added to %s: %s", p.day, TABLED, added)
 
+    added: list[str] = []
     con.execute("BEGIN TRANSACTION")
     try:
+        # Schema changes share the transaction, so a failed load leaves no new columns behind
+        if p.row_count > 0:
+            added = sync_schema(con, normalized)
+
         con.execute(f"DELETE FROM {TABLE} WHERE _partition_date = ?", [p.day])
  
         if p.row_count > 0:
@@ -203,10 +205,13 @@ def load_partition(con: duckdb.DuckDBByConnection, p: Partition, first_load: boo
             [p.day, p.extracted_at, loaded],
         )
         con.execute("COMMIT")
-        return loaded
     except Exception:
         con.execute("ROLLBACK")
         raise
+
+    if added and not first_load:
+        log.warning("%s: new source columns added to %s: %s", p.day, TABLE, added)
+    return loaded
 
 # --------------------------------------------------------------------------
 # CLI
