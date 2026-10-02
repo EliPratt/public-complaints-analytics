@@ -1,0 +1,29 @@
+version: 2
+
+models:
+  - name: stg_complaints
+    description: >
+      One row per CFPB complaint, typed and cleaned from raw.complaints.
+      Deduplicated to the latest extraction of each complaint.
+    columns:
+      - name: complaint_id
+        description: CFPB's unique complaint identifier.
+        data_tests:
+          - unique
+          - not_null
+      - name: date_received
+        description: Date the CFPB received the complaint.
+        data_tests:
+          - not_null
+      - name: date_sent_to_company
+        description: Date the CFPB forwarded the complaint to the company.
+      - name: product
+        data_tests:
+          - not_null
+      - name: company_name
+        data_tests:
+          - not_null
+      - name: is_timely_response
+        description: Whether the company responded within the CFPB's time window. NULL if not yet known.
+      - name: days_to_company
+        description: Days between the CFPB receiving the complaint and sending it to the company.

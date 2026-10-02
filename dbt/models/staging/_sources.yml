@@ -1,0 +1,19 @@
+version: 2
+
+sources:
+  - name: raw
+    description: Raw CFPB complaint data loaded by ingestion/load.py. All source columns are text.
+    schema: raw
+    tables:
+      - name: complaints
+        description: One row per complaint per daily partition, exactly as exported by the CFPB API.
+        loaded_at_field: _loaded_at
+        freshness:
+          warn_after: {count: 2, period: day}
+          error_after: {count: 4, period: day}
+        columns:
+          - name: complaint_id
+            # Checked on raw, not just staging: the staging dedupe would hide duplicates
+            data_tests:
+              - not_null
+              - unique

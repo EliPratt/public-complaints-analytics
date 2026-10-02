@@ -1,0 +1,10 @@
+# Lives in the project folder so the repo is self-contained.
+# Run dbt from inside dbt/ and it picks this up automatically.
+public_complaints:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('DUCKDB_PATH', '../data/warehouse/complaints.duckdb') }}"
+      schema: main
+      threads: 4
