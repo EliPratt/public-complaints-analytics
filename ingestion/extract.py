@@ -27,6 +27,12 @@ Before each export, the script asks the search endpoint how many complaints
 exist for that day and compares it with the rows actually received. A
 mismatch means the export was truncated or the data shifted mid-pull, and the
 day fails loudly instead of loading partial data.
+
+That comparison shares the request's date filter, so it cannot catch a wrong
+filter. Every row's own "Date received" is also checked against the day.
+And because the lookback overwrites recent partitions, a re-pull that comes
+back with less than half the rows already on disk fails instead of replacing
+them (override with --allow-shrink).
  
 Usage
 -----
@@ -60,11 +66,25 @@ DEFAULT_OUTPUT_DIR = Path("data/raw")
 DEFAULT_STATE_FILE = Path("data/state/extract_state.json")
 PAUSE_BETWEEN_DAYS_SECONDS = 1.0 # Public API - keep requests low
 MISMATCH_RETRIES = 1
+DOWNLOAD_RETRIES = 3
+DOWNLOAD_BACKOFF_SECONDS = 5 # 5s, 10s, 20s
+# Connection drops mid-download, which urllib3's Retry never sees
+DOWNLOAD_ERRORS = (
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ConnectionError,
+)
+DATE_RECEIVED_COLUMN = "Date received"
+# A re-pull that loses more than this share of a day's rows is treated as a bad
+# API response, not real data, and fails instead of overwriting the partition
+MAX_SHRINK_RATIO = 0.5
 
 log = logging.getLogger("cfpb.extract")
 
 class ReconciliationError(Exception):
     """Rows received do not match the API's reported total for the day."""
+
+class ShrinkError(ReconciliationError):
+    """A re-pull returned far fewer rows than the partition already holds."""
 
 @dataclass
 class DayManifest:
@@ -93,10 +113,10 @@ def build_session() -> requests.Session:
     return session
 
 def day_filter(day: date) -> dict[str, str]:
-    """API date filters: min is inclusive, max is exclusive."""
+    """API date filters: both min and max are inclusive, so one day is min == max."""
     return {
         "date_received_min": day.isoformat(),
-        "date_received_max": (day + timedelta(days = 1)).isoformat(),
+        "date_received_max": day.isoformat(),
     }
 
 def fetch_api_total (session: requests.Session, day: date) -> int:
@@ -109,20 +129,59 @@ def fetch_api_total (session: requests.Session, day: date) -> int:
     return int(total["value"] if isinstance(total, dict) else total)
 
 def fetch_day_export (session: requests.Session, day: date) -> bytes:
-    """Download every complaint for one day as CSV bytes"""
-    params = {**day_filter(day), "format": "csv", "no_aggs": "true"}
-    resp = session.get(API_URL, params=params, timeout=300)
-    resp.raise_for_status()
-    return resp.content
+    """Download every complaint for one day as CSV bytes.
 
-def count_csv_rows(raw: bytes) -> int:
-    """Count data rows. Uses the csv module because narratives contain newlines."""
+    The session's urllib3 retries only cover failures before the body starts.
+    A connection that drops mid-download surfaces here, while reading
+    resp.content, so it gets its own retry loop.
+    """
+    params = {**day_filter(day), "format": "csv", "no_aggs": "true"}
+    for attempt in range(DOWNLOAD_RETRIES + 1):
+        try:
+            resp = session.get(API_URL, params=params, timeout=300)
+            resp.raise_for_status()
+            return resp.content
+        except DOWNLOAD_ERRORS as exc:
+            if attempt == DOWNLOAD_RETRIES:
+                raise
+            wait = DOWNLOAD_BACKOFF_SECONDS * 2 ** attempt
+            log.warning(
+                "%s: download failed (%s), retrying in %ds (attempt %d)",
+                day, exc, wait, attempt + 1,
+            )
+            time.sleep(wait)
+
+def count_csv_rows(raw: bytes, day: date) -> int:
+    """Count data rows, checking that every row was received on `day`.
+
+    The API total and the export share the same date filter, so comparing
+    them cannot catch a wrong filter. Each row's own date can.
+    Uses the csv module because narratives contain newlines.
+    """
     text = raw.decode("utf-8-sig")
     if not text.strip():
         return 0
     reader = csv.reader(io.StringIO(text))
-    next(reader, None) # header
-    return sum(1 for row in reader if row)
+    header = next(reader, [])
+    try:
+        date_col = header.index(DATE_RECEIVED_COLUMN)
+    except ValueError:
+        raise ReconciliationError(f"{day}: export has no {DATE_RECEIVED_COLUMN!r} column")
+
+    expected = day.isoformat()
+    count = off_day = 0
+    for row in reader:
+        if not row:
+            continue
+        count += 1
+        # Values look like 2025-09-03T00:34:14.000Z; the API filters on this UTC date
+        if not row[date_col].startswith(expected):
+            off_day += 1
+    if off_day:
+        raise ReconciliationError(
+            f"{day}: {off_day} of {count} rows have a different {DATE_RECEIVED_COLUMN!r}"
+        )
+    return count
 
 
 # --------------------------------------------------------------------
@@ -136,12 +195,21 @@ def write_atomic(path: Path, data: bytes) -> None:
     tmp.write_bytes(data)
     os.replace(tmp, path)
 
-def extract_day(session: requests.Session, day: date, output_dir: Path) -> DayManifest:
+def previous_row_count(partition: Path) -> int | None:
+    """Row count from the partition's existing manifest, if it was pulled before."""
+    manifest_path = partition / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    return int(json.loads(manifest_path.read_text())["row_count"])
+
+def extract_day(
+        session: requests.Session, day: date, output_dir: Path, allow_shrink: bool = False
+) -> DayManifest:
     """Pull reconcile, and land one day of complaints"""
     for attempt in range(MISMATCH_RETRIES + 1):
         api_total = fetch_api_total(session, day)
         raw = fetch_day_export(session, day)
-        row_count = count_csv_rows(raw)
+        row_count = count_csv_rows(raw, day)
         if row_count == api_total:
             break
         log.warning(
@@ -152,8 +220,21 @@ def extract_day(session: requests.Session, day: date, output_dir: Path) -> DayMa
         raise ReconciliationError(
             f"{day}: received {row_count} rows, API reports {api_total}"
             )
-    
+
     partition = output_dir / f"date_received={day.isoformat()}"
+    # The lookback overwrites recent days on every run, so an empty or partial
+    # API response (whose total agrees with itself) would otherwise wipe good data
+    previous = previous_row_count(partition)
+    if (
+        not allow_shrink
+        and previous
+        and row_count < previous * (1 - MAX_SHRINK_RATIO)
+    ):
+        raise ShrinkError(
+            f"{day}: re-pull has {row_count} rows, partition has {previous}. "
+            f"Rerun with --allow-shrink if the drop is real."
+        )
+
     data_file = partition / "complaints.csv"
     write_atomic(data_file, raw)
 
@@ -219,6 +300,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS)
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     p.add_argument("--state-file", type=Path, default=DEFAULT_STATE_FILE)
+    p.add_argument(
+        "--allow-shrink", action="store_true",
+        help="Overwrite partitions even if the re-pull has far fewer rows",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -249,7 +334,7 @@ def main(argv: list[str] | None = None) -> int:
 
     for day in days:
         try:
-            manifest = extract_day(session, day, args.output_dir)
+            manifest = extract_day(session, day, args.output_dir, args.allow_shrink)
         except (requests.RequestException, ReconciliationError) as exc:
             # Days run in order, so the saved state still points at the last good day
             log.error("Stopping at %s: %s", day, exc)
