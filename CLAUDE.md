@@ -75,7 +75,7 @@ data/raw/date_received=YYYY-MM-DD/manifest.json    # row_count, api_total, extra
 
 ### dbt
 
-- `stg_complaints` (a view) types, cleans and dedupes `raw.complaints`. With correct partitions, the dedupe removes nothing: raw and staging row counts should be equal.
+- `stg_complaints` (a table, not the staging default of view, because of the dedupe cost) types, cleans and dedupes `raw.complaints`. With correct partitions, the dedupe removes nothing: raw and staging row counts should be equal.
 - Because the staging dedupe would hide duplicates coming from upstream, raw has its own tests: `unique` on `complaint_id` (`_sources.yml`) and `tests/assert_raw_rows_match_partition_date.sql`.
 - `macros/generate_schema_name.sql` uses custom schema names as-is (`staging`, `marts`), not `main_staging`.
 - Updates to existing complaints arrive through the lookback re-pull, which replaces the whole partition. Snapshots for tracking field history are planned.

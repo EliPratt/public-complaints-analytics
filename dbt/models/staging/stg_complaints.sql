@@ -11,7 +11,12 @@
     disputed fields that appear in the full CSV download, so they are not
     modeled here. If the API starts sending them, load.py adds the columns
     to raw.complaints automatically; add them here deliberately.
+  - Materialized as a table, unlike the staging default of view: the dedupe
+    window over ~7.5M rows would otherwise rerun in every downstream query
+    and test.
 #}
+
+{{ config(materialized='table') }}
 
 with source as (
 
